@@ -16,7 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -430,6 +430,7 @@ HTML_PAGE = """<!doctype html>
             <div class="chapter-meta">${renderChapterMeta(item.sequence)}</div>
             <div class="chapter-preview">${renderPreviewMeta(item.sequence, idx)}</div>
             <div class="chapter-buttons">
+              <button type="button" class="secondary mini" onclick="instantRead(event, ${idx})" ${previewBusyIndex === idx ? "disabled" : ""}>立即朗读</button>
               <button type="button" class="ghost mini" onclick="playChapter(event, ${idx})">${renderPlayButtonLabel(idx)}</button>
               <button type="button" class="secondary mini" onclick="regeneratePreview(event, ${idx})" ${previewBusyIndex === idx ? "disabled" : ""}>重新生成</button>
               <button type="button" class="ghost mini" onclick="clearPreview(event, ${idx})" ${renderClearButtonDisabled(item.sequence, idx)}>清理</button>
@@ -452,6 +453,7 @@ HTML_PAGE = """<!doctype html>
 
     function renderPreviewMeta(sequence, idx) {
       if (previewBusyIndex === idx) {
+        if (previewBusyAction === "instant") return "即时朗读：正在连接";
         return previewBusyAction === "regenerate" ? "试听：正在重新生成" : "试听：正在准备";
       }
       const preview = previewCacheMap()[String(sequence)];
@@ -645,6 +647,37 @@ HTML_PAGE = """<!doctype html>
       const ok = await ensurePreview(idx, true);
       if (!ok) return;
       await playAudioForChapter(idx);
+    }
+
+    async function instantRead(event, idx) {
+      stopButtonEvent(event);
+      const item = chapters[idx];
+      previewBusyIndex = idx;
+      previewBusyAction = "instant";
+      renderChapters(chapters);
+      setStatus(`正在连接即时朗读：${item.title}`);
+      const data = await postJson("/api/instant-read", {
+        index: idx,
+        voice: document.getElementById("voice").value,
+        rate: document.getElementById("rate").value,
+      });
+      previewBusyIndex = null;
+      previewBusyAction = "";
+      if (!data.ok) {
+        renderChapters(chapters);
+        setStatus(data.error || "即时朗读启动失败。");
+        return;
+      }
+      const player = document.getElementById("previewPlayer");
+      currentPreviewIndex = idx;
+      player.src = data.url;
+      updatePreviewPlayerTitle(`即时朗读 · ${item.title}`, "即时朗读不生成临时文件，进度条不保证可拖动跳转。");
+      try {
+        await player.play();
+      } catch (_err) {
+      }
+      renderChapters(chapters);
+      setStatus("即时朗读已开始。");
     }
 
     async function clearPreview(event, idx) {
@@ -1049,6 +1082,22 @@ async def stream_text_to_file(
             progress(int(idx * 100 / total_chunks))
 
 
+async def stream_text_to_http(text: str, handler: BaseHTTPRequestHandler, voice: str, rate: str) -> None:
+    chunks = split_long_text(text)
+    for chunk in chunks:
+        communicate = edge_tts.Communicate(
+            text=chunk,
+            voice=voice,
+            rate=rate,
+            pitch="-2Hz",
+            volume="+0%",
+        )
+        async for event in communicate.stream():
+            if event["type"] == "audio":
+                handler.wfile.write(event["data"])
+                handler.wfile.flush()
+
+
 async def synthesize_chapters_to_single_mp3(
     chapters: list[Chapter],
     output_path: Path,
@@ -1371,6 +1420,20 @@ def normalize_preview_request(data: dict[str, Any], chapters: list[Chapter]) -> 
     }
 
 
+def normalize_instant_read_request(data: dict[str, Any], chapters: list[Chapter]) -> dict[str, Any]:
+    normalized = normalize_preview_request(data, chapters)
+    return {
+        "index": normalized["index"],
+        "chapter": normalized["chapter"],
+        "voice": normalized["voice"],
+        "rate": normalized["rate"],
+    }
+
+
+def build_instant_audio_url(index: int, voice: str, rate: str) -> str:
+    return f"/api/instant-audio?{urlencode({'index': index, 'voice': voice, 'rate': rate})}"
+
+
 def ensure_chapter_preview(
     cache_dir: Path,
     chapter: Chapter,
@@ -1418,6 +1481,9 @@ class BookHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/preview-audio":
             self._handle_preview_audio(parsed)
             return
+        if parsed.path == "/api/instant-audio":
+            self._handle_instant_audio(parsed)
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -1439,6 +1505,9 @@ class BookHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/preview-clear":
             self._handle_preview_clear()
+            return
+        if parsed.path == "/api/instant-read":
+            self._handle_instant_read()
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1681,6 +1750,36 @@ class BookHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self._send_file(audio_path, "audio/mpeg")
+        except ValueError:
+            self.send_error(HTTPStatus.BAD_REQUEST)
+
+    def _handle_instant_read(self) -> None:
+        try:
+            data = self._read_json()
+            with STATE.lock:
+                chapters = list(STATE.chapters)
+            normalized = normalize_instant_read_request(data, chapters)
+            url = build_instant_audio_url(normalized["index"], normalized["voice"], normalized["rate"])
+            self._send_json({"ok": True, "sequence": normalized["chapter"].sequence, "url": url})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"即时朗读启动失败：{exc}"}, 500)
+
+    def _handle_instant_audio(self, parsed) -> None:
+        try:
+            query = parse_qs(parsed.query)
+            payload = {
+                "index": query.get("index", ["-1"])[0],
+                "voice": query.get("voice", [DEFAULT_VOICE])[0],
+                "rate": query.get("rate", ["-12%"])[0],
+            }
+            with STATE.lock:
+                chapters = list(STATE.chapters)
+            normalized = normalize_instant_read_request(payload, chapters)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            asyncio.run(stream_text_to_http(normalized["chapter"].text, self, normalized["voice"], normalized["rate"]))
         except ValueError:
             self.send_error(HTTPStatus.BAD_REQUEST)
 

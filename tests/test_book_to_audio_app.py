@@ -313,6 +313,31 @@ class BookToAudioAppTests(unittest.TestCase):
             self.assertFalse(audio_path.exists())
             self.assertFalse(meta_path.exists())
 
+    def test_normalize_instant_read_request_rejects_invalid_index(self):
+        chapters = [app.Chapter(title="第一章", text="正文", sequence=1)]
+
+        with self.assertRaisesRegex(ValueError, "章节索引无效"):
+            app.normalize_instant_read_request({"index": -1}, chapters)
+
+    def test_normalize_instant_read_request_falls_back_for_invalid_voice_and_rate(self):
+        chapters = [app.Chapter(title="第一章", text="正文", sequence=1)]
+
+        normalized = app.normalize_instant_read_request({"index": 0, "voice": 1, "rate": "fast"}, chapters)
+
+        self.assertEqual(normalized["chapter"].sequence, 1)
+        self.assertEqual(normalized["voice"], app.DEFAULT_VOICE)
+        self.assertEqual(normalized["rate"], "-12%")
+
+    def test_build_instant_audio_url_does_not_touch_preview_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = app.AppState()
+            state.preview_cache = {"1": {"exists": True}}
+
+            url = app.build_instant_audio_url(2, "voice", "rate")
+
+            self.assertEqual(url, "/api/instant-audio?index=2&voice=voice&rate=rate")
+            self.assertEqual(state.preview_cache, {"1": {"exists": True}})
+
 
 if __name__ == "__main__":
     unittest.main()
