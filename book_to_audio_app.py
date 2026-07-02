@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -14,6 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,6 +52,7 @@ import webview  # type: ignore
 SUPPORTED_EXTS = {".epub", ".mobi", ".pdf"}
 DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
+PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "book_to_audio_previews"
 VOICE_OPTIONS = [
     ("zh-CN-XiaoxiaoNeural", "中文女生 · 晓晓"),
     ("zh-CN-XiaoyiNeural", "中文女生 · 晓伊"),
@@ -63,6 +67,9 @@ VOICE_OPTIONS = [
     ("en-US-GuyNeural", "English Male · Guy"),
     ("en-US-DavisNeural", "English Male · Davis"),
 ]
+VALID_VOICE_IDS = {voice_id for voice_id, _label in VOICE_OPTIONS}
+VALID_RATES = {"-20%", "-12%", "-5%", "+0%", "+10%"}
+VALID_OUTPUT_MODES = {"per_chapter", "single_file"}
 MAX_PARALLEL_CHAPTERS = 3
 SPECIAL_HEADING_RE = re.compile(r"^(序|序章|前言|引言|楔子|后记|尾声|附录|番外|终章)$")
 PART_HEADING_RE = re.compile(
@@ -245,13 +252,55 @@ HTML_PAGE = """<!doctype html>
       align-items: center;
       margin-bottom: 10px;
     }
+    .preview-panel {
+      margin-bottom: 14px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #faf7f0;
+    }
+    .preview-panel audio {
+      width: 100%;
+      margin: 8px 0;
+    }
+    .preview-title {
+      font-weight: 700;
+      line-height: 1.45;
+    }
     .muted {
       color: var(--muted);
       font-size: 13px;
     }
+    .chapter-actions {
+      position: relative;
+      z-index: 1;
+      min-width: 220px;
+    }
+    .chapter-preview {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--muted);
+      text-align: right;
+    }
+    .chapter-buttons {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    button.mini {
+      padding: 7px 10px;
+      font-size: 12px;
+      border-radius: 10px;
+    }
     @media (max-width: 920px) {
       .grid { grid-template-columns: 1fr; }
       .hero h1 { font-size: 28px; }
+      .chapter-item { grid-template-columns: 24px 1fr; }
+      .chapter-actions { grid-column: 1 / -1; min-width: 0; }
+      .chapter-preview { text-align: left; }
+      .chapter-buttons { justify-content: flex-start; }
     }
   </style>
 </head>
@@ -325,6 +374,11 @@ HTML_PAGE = """<!doctype html>
             <button class="secondary" onclick="generateAll()">生成全部章节</button>
           </div>
         </div>
+        <div class="preview-panel">
+          <div class="preview-title" id="previewTitle">试听播放器</div>
+          <audio id="previewPlayer" controls preload="metadata"></audio>
+          <div class="muted" id="previewHint">点击章节上的“朗读”生成临时试听音频。试听音频会保留到你手动点击“清理”为止。</div>
+        </div>
         <div class="chapter-list" id="chapterList"></div>
       </section>
     </div>
@@ -334,6 +388,9 @@ HTML_PAGE = """<!doctype html>
     let chapters = [];
     let state = { busy: false };
     let pollTimer = null;
+    let previewBusyIndex = null;
+    let previewBusyAction = "";
+    let currentPreviewIndex = null;
 
     function setStatus(text) {
       document.getElementById("status").textContent = text;
@@ -341,6 +398,10 @@ HTML_PAGE = """<!doctype html>
 
     function chapterProgressMap() {
       return state.chapter_progress || {};
+    }
+
+    function previewCacheMap() {
+      return state.preview_cache || {};
     }
 
     function selectedIndices() {
@@ -365,7 +426,15 @@ HTML_PAGE = """<!doctype html>
           <div class="chapter-text">
             <div class="chapter-name">${String(item.sequence || idx + 1).padStart(3, "0")}. ${escapeHtml(item.title)}</div>
           </div>
-          <div class="chapter-meta">${renderChapterMeta(item.sequence)}</div>
+          <div class="chapter-actions">
+            <div class="chapter-meta">${renderChapterMeta(item.sequence)}</div>
+            <div class="chapter-preview">${renderPreviewMeta(item.sequence, idx)}</div>
+            <div class="chapter-buttons">
+              <button type="button" class="ghost mini" onclick="playChapter(event, ${idx})">${renderPlayButtonLabel(idx)}</button>
+              <button type="button" class="secondary mini" onclick="regeneratePreview(event, ${idx})" ${previewBusyIndex === idx ? "disabled" : ""}>重新生成</button>
+              <button type="button" class="ghost mini" onclick="clearPreview(event, ${idx})" ${renderClearButtonDisabled(item.sequence, idx)}>清理</button>
+            </div>
+          </div>
         </label>
       `).join("");
     }
@@ -379,6 +448,32 @@ HTML_PAGE = """<!doctype html>
       if (status === "queued") return "等待中";
       if (status === "error") return "失败";
       return "未开始";
+    }
+
+    function renderPreviewMeta(sequence, idx) {
+      if (previewBusyIndex === idx) {
+        return previewBusyAction === "regenerate" ? "试听：正在重新生成" : "试听：正在准备";
+      }
+      const preview = previewCacheMap()[String(sequence)];
+      if (!preview || !preview.exists) return "试听：未生成";
+      const currentVoice = document.getElementById("voice").value;
+      const currentRate = document.getElementById("rate").value;
+      if (preview.voice === currentVoice && preview.rate === currentRate) {
+        return `试听：已缓存 · ${escapeHtml(preview.voice)} · ${escapeHtml(preview.rate)}`;
+      }
+      return `试听：缓存为 ${escapeHtml(preview.voice || "")} ${escapeHtml(preview.rate || "")}`.trim();
+    }
+
+    function renderPlayButtonLabel(idx) {
+      if (previewBusyIndex === idx) return "准备中";
+      if (currentPreviewIndex === idx) return "重新播放";
+      return "朗读";
+    }
+
+    function renderClearButtonDisabled(sequence, idx) {
+      if (previewBusyIndex === idx) return "disabled";
+      const preview = previewCacheMap()[String(sequence)];
+      return (!preview || !preview.exists) ? "disabled" : "";
     }
 
     function escapeHtml(text) {
@@ -438,6 +533,13 @@ HTML_PAGE = """<!doctype html>
         setStatus(data.error || "解析失败。");
         return;
       }
+      state.preview_cache = data.preview_cache || {};
+      const player = document.getElementById("previewPlayer");
+      player.pause();
+      player.removeAttribute("src");
+      player.load();
+      currentPreviewIndex = null;
+      updatePreviewPlayerTitle("试听播放器", "点击章节上的“朗读”生成临时试听音频。试听音频会保留到你手动点击“清理”为止。");
       renderChapters(data.chapters);
       setStatus(`已解析 ${data.chapters.length} 个章节。`);
     }
@@ -471,6 +573,100 @@ HTML_PAGE = """<!doctype html>
 
     function generateAll() {
       startGenerate(chapters.map((_, idx) => idx));
+    }
+
+    function stopButtonEvent(event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+
+    function previewMatchesCurrentSettings(sequence) {
+      const preview = previewCacheMap()[String(sequence)];
+      if (!preview || !preview.exists) return false;
+      return preview.voice === document.getElementById("voice").value && preview.rate === document.getElementById("rate").value;
+    }
+
+    function updatePreviewPlayerTitle(text, hint = "") {
+      document.getElementById("previewTitle").textContent = text;
+      document.getElementById("previewHint").textContent = hint;
+    }
+
+    async function playAudioForChapter(idx) {
+      const player = document.getElementById("previewPlayer");
+      const item = chapters[idx];
+      currentPreviewIndex = idx;
+      player.src = `/api/preview-audio?index=${idx}&t=${Date.now()}`;
+      updatePreviewPlayerTitle(`试听播放器 · ${item.title}`, "可直接拖动进度条跳转。");
+      try {
+        await player.play();
+      } catch (_err) {
+      }
+      renderChapters(chapters);
+    }
+
+    async function ensurePreview(idx, force) {
+      const item = chapters[idx];
+      previewBusyIndex = idx;
+      previewBusyAction = force ? "regenerate" : "play";
+      renderChapters(chapters);
+      setStatus(force ? `正在重新生成试听：${item.title}` : `正在准备试听：${item.title}`);
+      const data = await postJson("/api/preview-chapter", {
+        index: idx,
+        voice: document.getElementById("voice").value,
+        rate: document.getElementById("rate").value,
+        force,
+      });
+      previewBusyIndex = null;
+      previewBusyAction = "";
+      if (!data.ok) {
+        renderChapters(chapters);
+        setStatus(data.error || "试听生成失败。");
+        return false;
+      }
+      state.preview_cache = state.preview_cache || {};
+      state.preview_cache[String(data.sequence)] = data.preview_cache;
+      renderChapters(chapters);
+      setStatus(data.reused ? "已使用缓存试听音频。" : "试听音频已生成。");
+      return true;
+    }
+
+    async function playChapter(event, idx) {
+      stopButtonEvent(event);
+      const item = chapters[idx];
+      if (!previewMatchesCurrentSettings(item.sequence)) {
+        const ok = await ensurePreview(idx, false);
+        if (!ok) return;
+      }
+      await playAudioForChapter(idx);
+    }
+
+    async function regeneratePreview(event, idx) {
+      stopButtonEvent(event);
+      const ok = await ensurePreview(idx, true);
+      if (!ok) return;
+      await playAudioForChapter(idx);
+    }
+
+    async function clearPreview(event, idx) {
+      stopButtonEvent(event);
+      const data = await postJson("/api/preview-clear", { index: idx });
+      if (!data.ok) {
+        setStatus(data.error || "试听缓存清理失败。");
+        return;
+      }
+      if (state.preview_cache) {
+        delete state.preview_cache[String(data.sequence)];
+      }
+      if (currentPreviewIndex === idx) {
+        const player = document.getElementById("previewPlayer");
+        player.pause();
+        player.removeAttribute("src");
+        player.load();
+        currentPreviewIndex = null;
+        updatePreviewPlayerTitle("试听播放器", "当前章节试听缓存已清理。");
+      }
+      renderChapters(chapters);
+      setStatus("试听缓存已清理。");
     }
 
     async function pollStatus() {
@@ -541,6 +737,49 @@ def html_fragment_to_text_and_title(content: bytes | str) -> tuple[str, str]:
     return text, title
 
 
+def is_heading_like_line(text: str) -> bool:
+    line = text.strip()
+    if not line:
+        return False
+    return bool(
+        SPECIAL_HEADING_RE.match(line)
+        or PART_HEADING_RE.match(line)
+        or CHAPTER_HEADING_RE.match(line)
+        or SECTION_HEADING_RE.match(line)
+    )
+
+
+def should_reflow_lines(current: str, next_line: str) -> bool:
+    left = current.strip()
+    right = next_line.strip()
+    if not left or not right:
+        return False
+    if is_heading_like_line(left) or is_heading_like_line(right):
+        return False
+    if re.search(r"[。！？?!；;]$", left):
+        return False
+    if min(len(left), len(right)) <= 2:
+        return True
+    return len(left) <= 3 and len(right) <= 3
+
+
+def reflow_broken_lines(lines: list[str]) -> list[str]:
+    merged: list[str] = []
+    current = ""
+    for line in lines:
+        if not current:
+            current = line
+            continue
+        if should_reflow_lines(current, line):
+            current += line
+        else:
+            merged.append(current)
+            current = line
+    if current:
+        merged.append(current)
+    return merged
+
+
 def normalize_text(text: str) -> str:
     text = html.unescape(text)
     text = text.replace("\r", "\n")
@@ -549,6 +788,7 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
+    lines = reflow_broken_lines(lines)
     return "\n".join(lines).strip()
 
 
@@ -562,12 +802,14 @@ def split_long_text(text: str, limit: int = 2400) -> list[str]:
             unit = unit.strip()
             if not unit:
                 continue
-            if len(current) + len(unit) + 1 <= limit:
-                current = f"{current}\n{unit}".strip()
-            else:
-                if current:
-                    chunks.append(current)
-                current = unit
+            pieces = [unit[i : i + limit] for i in range(0, len(unit), limit)] if len(unit) > limit else [unit]
+            for piece in pieces:
+                if len(current) + len(piece) + 1 <= limit:
+                    current = f"{current}\n{piece}".strip()
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = piece
         if current and len(current) >= limit:
             chunks.append(current)
             current = ""
@@ -612,6 +854,17 @@ def compose_heading_title(part_title: str, chapter_title: str, section_title: st
     return " ".join(pieces) if pieces else fallback
 
 
+def is_heading_suffix_line(text: str) -> bool:
+    line = normalize_text(text)
+    if not line or is_heading_like_line(line):
+        return False
+    if len(line) > 30:
+        return False
+    if re.search(r"[。！？?!；;]$", line):
+        return False
+    return True
+
+
 def split_structured_text(title: str, text: str) -> list[Chapter]:
     lines = [line.strip() for line in normalize_text(text).splitlines() if line.strip()]
     clean_title = normalize_text(title)
@@ -627,6 +880,7 @@ def split_structured_text(title: str, text: str) -> list[Chapter]:
     current_body: list[str] = []
     result: list[Chapter] = []
     saw_structured_heading = False
+    expecting_heading_suffix = False
 
     def flush_current() -> None:
         nonlocal current_body, current_title
@@ -638,6 +892,17 @@ def split_structured_text(title: str, text: str) -> list[Chapter]:
     for line in lines:
         level = heading_level(line)
         if level == 0:
+            if expecting_heading_suffix and not current_body and is_heading_suffix_line(line):
+                if section_title:
+                    section_title = f"{section_title} {line}"
+                elif chapter_title:
+                    chapter_title = f"{chapter_title} {line}"
+                elif part_title:
+                    part_title = f"{part_title} {line}"
+                current_title = compose_heading_title(part_title, chapter_title, section_title, current_title)
+                expecting_heading_suffix = False
+                continue
+            expecting_heading_suffix = False
             current_body.append(line)
             continue
         saw_structured_heading = True
@@ -647,18 +912,22 @@ def split_structured_text(title: str, text: str) -> list[Chapter]:
             chapter_title = ""
             section_title = ""
             current_title = line
+            expecting_heading_suffix = False
         elif level == 2:
             part_title = line
             chapter_title = ""
             section_title = ""
             current_title = part_title
+            expecting_heading_suffix = True
         elif level == 3:
             chapter_title = line
             section_title = ""
             current_title = compose_heading_title(part_title, chapter_title, "", line)
+            expecting_heading_suffix = True
         else:
             section_title = line
             current_title = compose_heading_title(part_title, chapter_title, section_title, line)
+            expecting_heading_suffix = True
     flush_current()
 
     if not saw_structured_heading or not result:
@@ -818,29 +1087,41 @@ async def synthesize_chapters_to_files(
     output_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_parallel)
     total = len(chapters)
+    failures: list[str] = []
 
     async def one_chapter(idx: int, chapter: Chapter) -> None:
         async with semaphore:
-            if log:
-                log(f"[{idx}/{total}] 生成中：{chapter.title}")
-            output_path = output_dir / build_output_filename(chapter)
-            if progress:
-                progress(chapter.sequence, 0, "processing")
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with output_path.open("wb") as f:
-                await stream_text_to_file(
-                    chapter.text,
-                    f,
-                    voice,
-                    rate,
-                    None if progress is None else lambda percent, seq=chapter.sequence: progress(seq, percent, "processing"),
-                )
-            if progress:
-                progress(chapter.sequence, 100, "done")
-            if log:
-                log(f"完成：{output_path}")
+            try:
+                if log:
+                    log(f"[{idx}/{total}] 生成中：{chapter.title}")
+                output_path = output_dir / build_output_filename(chapter)
+                if progress:
+                    progress(chapter.sequence, 0, "processing")
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("wb") as f:
+                    await stream_text_to_file(
+                        chapter.text,
+                        f,
+                        voice,
+                        rate,
+                        None
+                        if progress is None
+                        else lambda percent, seq=chapter.sequence: progress(seq, percent, "processing"),
+                    )
+                if progress:
+                    progress(chapter.sequence, 100, "done")
+                if log:
+                    log(f"完成：{output_path}")
+            except Exception as exc:
+                failures.append(f"{chapter.title}: {exc}")
+                if progress:
+                    progress(chapter.sequence, 0, "error")
+                if log:
+                    log(f"失败：{chapter.title}: {exc}")
 
     await asyncio.gather(*(one_chapter(idx, chapter) for idx, chapter in enumerate(chapters, start=1)))
+    if failures:
+        raise RuntimeError("；".join(failures))
 
 
 def run_powershell_dialog(script: str) -> str:
@@ -903,6 +1184,7 @@ class AppState:
         self.busy = False
         self.status_text = "请选择图书文件，然后点击“解析章节”。"
         self.chapter_progress: dict[str, dict[str, Any]] = {}
+        self.preview_cache: dict[str, dict[str, Any]] = {}
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -918,6 +1200,7 @@ class AppState:
                 "status_text": self.status_text,
                 "logs": list(self.logs),
                 "chapter_progress": dict(self.chapter_progress),
+                "preview_cache": dict(self.preview_cache),
             }
 
     def set_active_chapters(self, chapters: list[Chapter]) -> None:
@@ -944,6 +1227,27 @@ class AppState:
             current["status"] = status
             self.chapter_progress[key] = current
 
+    def mark_unfinished_chapters_error(self, chapters: list[Chapter]) -> None:
+        with self.lock:
+            for chapter in chapters:
+                key = str(chapter.sequence)
+                current = self.chapter_progress.get(key, {"percent": 0, "status": "idle"})
+                if current.get("status") != "done":
+                    current["status"] = "error"
+                    self.chapter_progress[key] = current
+
+    def set_preview_cache(self, preview_cache: dict[str, dict[str, Any]]) -> None:
+        with self.lock:
+            self.preview_cache = preview_cache
+
+    def update_preview_entry(self, sequence: int, entry: dict[str, Any]) -> None:
+        with self.lock:
+            self.preview_cache[str(sequence)] = entry
+
+    def clear_preview_entry(self, sequence: int) -> None:
+        with self.lock:
+            self.preview_cache.pop(str(sequence), None)
+
 
 def build_single_output_name(file_path: str, selected: list[Chapter]) -> str:
     stem = sanitize_filename(Path(file_path).stem or "book")
@@ -954,31 +1258,187 @@ def build_single_output_name(file_path: str, selected: list[Chapter]) -> str:
     return f"{stem}-{start:03d}-{end:03d}-合并音频.mp3"
 
 
+def preview_book_cache_dir(file_path: str) -> Path:
+    digest = hashlib.sha1(file_path.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return PREVIEW_CACHE_ROOT / digest
+
+
+def chapter_preview_paths(cache_dir: Path, chapter: Chapter) -> tuple[Path, Path]:
+    base_name = f"{chapter.sequence:03d}-{sanitize_filename(chapter.title)}-preview"
+    return cache_dir / f"{base_name}.mp3", cache_dir / f"{base_name}.json"
+
+
+def preview_cache_entry(cache_dir: Path, chapter: Chapter) -> dict[str, Any]:
+    audio_path, meta_path = chapter_preview_paths(cache_dir, chapter)
+    voice = ""
+    rate = ""
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            voice = meta.get("voice", "") if isinstance(meta.get("voice", ""), str) else ""
+            rate = meta.get("rate", "") if isinstance(meta.get("rate", ""), str) else ""
+        except Exception:
+            voice = ""
+            rate = ""
+    return {
+        "sequence": chapter.sequence,
+        "title": chapter.title,
+        "exists": audio_path.exists(),
+        "voice": voice,
+        "rate": rate,
+    }
+
+
+def scan_preview_cache(file_path: str, chapters: list[Chapter]) -> dict[str, dict[str, Any]]:
+    if not file_path:
+        return {}
+    cache_dir = preview_book_cache_dir(file_path)
+    preview_cache: dict[str, dict[str, Any]] = {}
+    for chapter in chapters:
+        entry = preview_cache_entry(cache_dir, chapter)
+        if entry["exists"]:
+            preview_cache[str(chapter.sequence)] = entry
+    return preview_cache
+
+
+def normalize_generate_request(data: dict[str, Any], chapters: list[Chapter]) -> dict[str, Any]:
+    indices = data.get("indices", [])
+    if not isinstance(indices, list):
+        raise ValueError("章节索引无效。")
+    if not chapters:
+        raise ValueError("请先解析章节。")
+
+    selected: list[Chapter] = []
+    seen: set[int] = set()
+    for item in indices:
+        try:
+            idx = int(item)
+        except (TypeError, ValueError):
+            raise ValueError("章节索引无效。") from None
+        if idx < 0 or idx >= len(chapters):
+            raise ValueError("章节索引无效。")
+        if idx not in seen:
+            selected.append(chapters[idx])
+            seen.add(idx)
+    if not selected:
+        raise ValueError("请至少选择一个章节。")
+
+    output_dir_raw = data.get("output_dir", "")
+    if not isinstance(output_dir_raw, str) or not output_dir_raw.strip():
+        raise ValueError("输出目录不能为空。")
+    output_dir = Path(output_dir_raw.strip()).expanduser()
+
+    voice_raw = data.get("voice", DEFAULT_VOICE)
+    voice = voice_raw if isinstance(voice_raw, str) and voice_raw in VALID_VOICE_IDS else DEFAULT_VOICE
+
+    rate_raw = data.get("rate", "-12%")
+    rate = rate_raw if isinstance(rate_raw, str) and rate_raw in VALID_RATES else "-12%"
+
+    output_mode_raw = data.get("output_mode", "per_chapter")
+    output_mode = output_mode_raw if isinstance(output_mode_raw, str) and output_mode_raw in VALID_OUTPUT_MODES else "per_chapter"
+
+    return {
+        "selected": selected,
+        "output_dir": output_dir,
+        "voice": voice,
+        "rate": rate,
+        "output_mode": output_mode,
+    }
+
+
+def normalize_preview_request(data: dict[str, Any], chapters: list[Chapter]) -> dict[str, Any]:
+    if not chapters:
+        raise ValueError("请先解析章节。")
+    try:
+        idx = int(data.get("index", -1))
+    except (TypeError, ValueError):
+        raise ValueError("章节索引无效。") from None
+    if idx < 0 or idx >= len(chapters):
+        raise ValueError("章节索引无效。")
+
+    voice_raw = data.get("voice", DEFAULT_VOICE)
+    voice = voice_raw if isinstance(voice_raw, str) and voice_raw in VALID_VOICE_IDS else DEFAULT_VOICE
+
+    rate_raw = data.get("rate", "-12%")
+    rate = rate_raw if isinstance(rate_raw, str) and rate_raw in VALID_RATES else "-12%"
+
+    return {
+        "index": idx,
+        "chapter": chapters[idx],
+        "voice": voice,
+        "rate": rate,
+        "force": bool(data.get("force", False)),
+    }
+
+
+def ensure_chapter_preview(
+    cache_dir: Path,
+    chapter: Chapter,
+    voice: str,
+    rate: str,
+    force: bool = False,
+    synthesize: Callable[[str, Path, str, str], Any] = synthesize_to_mp3,
+) -> dict[str, Any]:
+    current = preview_cache_entry(cache_dir, chapter)
+    if current["exists"] and current["voice"] == voice and current["rate"] == rate and not force:
+        return current
+
+    audio_path, meta_path = chapter_preview_paths(cache_dir, chapter)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    asyncio.run(synthesize(chapter.text, audio_path, voice, rate))
+    meta_path.write_text(
+        json.dumps({"voice": voice, "rate": rate, "title": chapter.title}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return preview_cache_entry(cache_dir, chapter)
+
+
+def clear_chapter_preview(cache_dir: Path, chapter: Chapter) -> bool:
+    audio_path, meta_path = chapter_preview_paths(cache_dir, chapter)
+    removed = False
+    for path in [audio_path, meta_path]:
+        if path.exists():
+            path.unlink()
+            removed = True
+    return removed
+
+
 STATE = AppState()
 
 
 class BookHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path == "/":
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
             self._send_html(HTML_PAGE)
             return
-        if self.path == "/api/status":
+        if parsed.path == "/api/status":
             self._send_json({"ok": True, **STATE.snapshot()})
+            return
+        if parsed.path == "/api/preview-audio":
+            self._handle_preview_audio(parsed)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        if self.path == "/api/pick-file":
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/pick-file":
             self._handle_pick_file()
             return
-        if self.path == "/api/pick-folder":
+        if parsed.path == "/api/pick-folder":
             self._handle_pick_folder()
             return
-        if self.path == "/api/load-book":
+        if parsed.path == "/api/load-book":
             self._handle_load_book()
             return
-        if self.path == "/api/generate":
+        if parsed.path == "/api/generate":
             self._handle_generate()
+            return
+        if parsed.path == "/api/preview-chapter":
+            self._handle_preview_chapter()
+            return
+        if parsed.path == "/api/preview-clear":
+            self._handle_preview_clear()
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1005,6 +1465,43 @@ class BookHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_file(self, path: Path, content_type: str) -> None:
+        size = path.stat().st_size
+        range_header = self.headers.get("Range", "")
+        start = 0
+        end = size - 1
+        status = HTTPStatus.OK
+        range_match = re.match(r"bytes=(\d*)-(\d*)", range_header)
+        if range_match:
+            if range_match.group(1):
+                start = int(range_match.group(1))
+            if range_match.group(2):
+                end = int(range_match.group(2))
+            end = min(end, size - 1)
+            if start > end or start >= size:
+                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                return
+            status = HTTPStatus.PARTIAL_CONTENT
+
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+
+        with path.open("rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _handle_pick_file(self) -> None:
         try:
@@ -1046,6 +1543,7 @@ class BookHandler(BaseHTTPRequestHandler):
                 STATE.logs.append(f"已解析文件：{path}")
                 STATE.logs.append(f"章节数：{len(chapters)}")
                 STATE.reset_chapter_progress()
+                STATE.set_preview_cache(scan_preview_cache(str(path), chapters))
             payload = [
                 {
                     "title": chapter.title,
@@ -1053,27 +1551,26 @@ class BookHandler(BaseHTTPRequestHandler):
                 }
                 for chapter in chapters
             ]
-            self._send_json({"ok": True, "chapters": payload, "logs": STATE.snapshot()["logs"]})
+            snapshot = STATE.snapshot()
+            self._send_json(
+                {"ok": True, "chapters": payload, "logs": snapshot["logs"], "preview_cache": snapshot["preview_cache"]}
+            )
         except Exception as exc:
             self._send_json({"ok": False, "error": f"解析失败：{exc}"}, 500)
 
     def _handle_generate(self) -> None:
         try:
             data = self._read_json()
-            indices = data.get("indices", [])
-            output_dir = Path(data.get("output_dir", "")).expanduser()
-            voice = data.get("voice", DEFAULT_VOICE)
-            rate = data.get("rate", "-12%")
-            output_mode = data.get("output_mode", "per_chapter")
             with STATE.lock:
                 if STATE.busy:
                     raise ValueError("已有任务在生成中，请稍后。")
                 chapters = STATE.chapters
-                if not chapters:
-                    raise ValueError("请先解析章节。")
-                selected = [chapters[int(i)] for i in indices]
-                if not selected:
-                    raise ValueError("请至少选择一个章节。")
+                normalized = normalize_generate_request(data, chapters)
+                selected = normalized["selected"]
+                output_dir = normalized["output_dir"]
+                voice = normalized["voice"]
+                rate = normalized["rate"]
+                output_mode = normalized["output_mode"]
                 STATE.busy = True
                 STATE.output_dir = str(output_dir)
                 STATE.status_text = "正在生成音频……"
@@ -1107,8 +1604,7 @@ class BookHandler(BaseHTTPRequestHandler):
                             STATE.status_text = f"生成完成，共 {total} 个 mp3。"
                 except Exception as exc:
                     STATE.log(f"失败：{exc}")
-                    for chapter in selected:
-                        STATE.update_chapter_progress(chapter.sequence, 0, "error")
+                    STATE.mark_unfinished_chapters_error(selected)
                     with STATE.lock:
                         STATE.status_text = f"生成失败：{exc}"
                 finally:
@@ -1119,6 +1615,74 @@ class BookHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         except Exception as exc:
             self._send_json({"ok": False, "error": f"启动失败：{exc}"}, 500)
+
+    def _handle_preview_chapter(self) -> None:
+        try:
+            data = self._read_json()
+            with STATE.lock:
+                chapters = list(STATE.chapters)
+                file_path = STATE.file_path
+            if not file_path:
+                raise ValueError("请先解析章节。")
+            normalized = normalize_preview_request(data, chapters)
+            cache_dir = preview_book_cache_dir(file_path)
+            previous = preview_cache_entry(cache_dir, normalized["chapter"])
+            entry = ensure_chapter_preview(
+                cache_dir,
+                normalized["chapter"],
+                normalized["voice"],
+                normalized["rate"],
+                normalized["force"],
+            )
+            STATE.update_preview_entry(normalized["chapter"].sequence, entry)
+            with STATE.lock:
+                STATE.status_text = f"试听音频已就绪：{normalized['chapter'].title}"
+            reused = (
+                previous["exists"]
+                and not normalized["force"]
+                and previous["voice"] == normalized["voice"]
+                and previous["rate"] == normalized["rate"]
+            )
+            self._send_json({"ok": True, "sequence": normalized["chapter"].sequence, "preview_cache": entry, "reused": reused})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"试听生成失败：{exc}"}, 500)
+
+    def _handle_preview_clear(self) -> None:
+        try:
+            data = self._read_json()
+            with STATE.lock:
+                chapters = list(STATE.chapters)
+                file_path = STATE.file_path
+            if not file_path:
+                raise ValueError("请先解析章节。")
+            normalized = normalize_preview_request(data, chapters)
+            cache_dir = preview_book_cache_dir(file_path)
+            removed = clear_chapter_preview(cache_dir, normalized["chapter"])
+            STATE.clear_preview_entry(normalized["chapter"].sequence)
+            with STATE.lock:
+                STATE.status_text = f"已清理试听缓存：{normalized['chapter'].title}"
+            self._send_json({"ok": True, "sequence": normalized["chapter"].sequence, "removed": removed})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"试听缓存清理失败：{exc}"}, 500)
+
+    def _handle_preview_audio(self, parsed) -> None:
+        try:
+            query = parse_qs(parsed.query)
+            index_value = query.get("index", ["-1"])[0]
+            with STATE.lock:
+                chapters = list(STATE.chapters)
+                file_path = STATE.file_path
+            if not file_path:
+                raise ValueError("请先解析章节。")
+            normalized = normalize_preview_request({"index": index_value}, chapters)
+            cache_dir = preview_book_cache_dir(file_path)
+            audio_path, _ = chapter_preview_paths(cache_dir, normalized["chapter"])
+            if not audio_path.exists():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self._send_file(audio_path, "audio/mpeg")
+        except ValueError:
+            self.send_error(HTTPStatus.BAD_REQUEST)
 
 
 def find_free_port() -> int:

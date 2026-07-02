@@ -11,6 +11,7 @@ build/
 dist/
 work/
 outputs/
+docs/
 
 *.spec
 *.log
