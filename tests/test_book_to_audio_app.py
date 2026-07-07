@@ -51,11 +51,73 @@ class BookToAudioAppTests(unittest.TestCase):
         self.assertIn("en-US-GuyNeural", voice_ids)
         self.assertIn("en-US-DavisNeural", voice_ids)
 
+    def test_voice_options_include_more_chinese_voices(self):
+        voice_ids = {voice_id for voice_id, _label in app.VOICE_OPTIONS}
+
+        self.assertIn("zh-HK-HiuGaaiNeural", voice_ids)
+        self.assertIn("zh-HK-HiuMaanNeural", voice_ids)
+        self.assertIn("zh-HK-WanLungNeural", voice_ids)
+        self.assertIn("zh-TW-HsiaoChenNeural", voice_ids)
+        self.assertIn("zh-TW-HsiaoYuNeural", voice_ids)
+        self.assertIn("zh-TW-YunJheNeural", voice_ids)
+
+    def test_voice_options_include_more_english_voices(self):
+        voice_ids = {voice_id for voice_id, _label in app.VOICE_OPTIONS}
+
+        self.assertIn("en-US-AvaNeural", voice_ids)
+        self.assertIn("en-US-EmmaNeural", voice_ids)
+        self.assertIn("en-US-AndrewNeural", voice_ids)
+        self.assertIn("en-US-BrianNeural", voice_ids)
+        self.assertIn("en-US-RogerNeural", voice_ids)
+        self.assertIn("en-US-MichelleNeural", voice_ids)
+
+    def test_voice_groups_cover_all_voice_options(self):
+        voice_ids = {voice_id for voice_id, _label in app.VOICE_OPTIONS}
+        grouped_ids = {voice_id for _group, items in app.VOICE_OPTION_GROUPS for voice_id, _label in items}
+
+        self.assertEqual(grouped_ids, voice_ids)
+
     def test_html_fallback_extracts_title_and_text_without_bs4(self):
         text, title = app.html_fragment_to_text_and_title("<html><body><h1>第一章 认识金钱</h1><p>正文内容</p></body></html>")
 
         self.assertEqual(title, "第一章 认识金钱")
         self.assertIn("正文内容", text)
+
+    def test_extract_txt_chapters_splits_structured_content(self):
+        content = "序言\n这是序言内容，足够长。" + ("甲" * 90) + "\n第一章 认识金钱\n这是第一章内容。" + ("乙" * 90)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "book.txt"
+            path.write_text(content, encoding="utf-8")
+
+            chapters = app.extract_txt_chapters(path)
+
+        self.assertEqual([item.title for item in chapters], ["序言", "第一章 认识金钱"])
+
+    def test_extract_markdown_chapters_uses_headings(self):
+        content = "# 序言\n\n这是序言内容。" + ("甲" * 90) + "\n\n## 第一章 认识金钱\n\n这是第一章内容。" + ("乙" * 90)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "book.md"
+            path.write_text(content, encoding="utf-8")
+
+            chapters = app.extract_markdown_chapters(path)
+
+        self.assertEqual([item.title for item in chapters], ["序言", "第一章 认识金钱"])
+
+    def test_normalize_chapter_text_request_rejects_invalid_index(self):
+        chapters = [app.Chapter(title="第一章", text="正文", sequence=1)]
+
+        with self.assertRaisesRegex(ValueError, "章节索引无效"):
+            app.normalize_chapter_text_request({"index": -1}, chapters)
+
+    def test_chapter_text_payload_returns_normalized_text(self):
+        chapter = app.Chapter(title="第一章", text="他\n来\n了。", sequence=1)
+
+        payload = app.chapter_text_payload(chapter)
+
+        self.assertEqual(payload["title"], "第一章")
+        self.assertEqual(payload["text"], "他来了。")
 
     def test_split_structured_chapters_preserves_part_and_chapter_order(self):
         source = [

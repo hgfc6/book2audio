@@ -49,7 +49,7 @@ import edge_tts  # type: ignore
 import webview  # type: ignore
 
 
-SUPPORTED_EXTS = {".epub", ".mobi", ".pdf"}
+SUPPORTED_EXTS = {".epub", ".mobi", ".pdf", ".txt", ".md", ".markdown"}
 DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
 PREVIEW_CACHE_ROOT = Path(tempfile.gettempdir()) / "book_to_audio_previews"
@@ -62,16 +62,69 @@ VOICE_OPTIONS = [
     ("zh-CN-YunjianNeural", "中文男生 · 云健"),
     ("zh-CN-YunxiaNeural", "中文男生 · 云夏"),
     ("zh-CN-YunyangNeural", "中文男生 · 云扬"),
+    ("zh-HK-HiuGaaiNeural", "粤语女生 · 曉佳"),
+    ("zh-HK-HiuMaanNeural", "粤语女生 · 曉曼"),
+    ("zh-HK-WanLungNeural", "粤语男生 · 雲龍"),
+    ("zh-TW-HsiaoChenNeural", "中文台湾女生 · 曉臻"),
+    ("zh-TW-HsiaoYuNeural", "中文台湾女生 · 曉雨"),
+    ("zh-TW-YunJheNeural", "中文台湾男生 · 雲哲"),
+    ("en-US-AvaNeural", "English Female · Ava"),
+    ("en-US-EmmaNeural", "English Female · Emma"),
     ("en-US-JennyNeural", "English Female · Jenny"),
+    ("en-US-MichelleNeural", "English Female · Michelle"),
+    ("en-US-AndrewNeural", "English Male · Andrew"),
+    ("en-US-BrianNeural", "English Male · Brian"),
     ("en-US-AriaNeural", "English Female · Aria"),
     ("en-US-GuyNeural", "English Male · Guy"),
+    ("en-US-RogerNeural", "English Male · Roger"),
     ("en-US-DavisNeural", "English Male · Davis"),
+]
+VOICE_OPTION_GROUPS = [
+    (
+        "中文常用",
+        [
+            ("zh-CN-XiaoxiaoNeural", "中文女生 · 晓晓"),
+            ("zh-CN-XiaoyiNeural", "中文女生 · 晓伊"),
+            ("zh-CN-YunxiNeural", "中文男生 · 云希"),
+            ("zh-CN-YunjianNeural", "中文男生 · 云健"),
+            ("zh-CN-YunxiaNeural", "中文男生 · 云夏"),
+            ("zh-CN-YunyangNeural", "中文男生 · 云扬"),
+        ],
+    ),
+    (
+        "更多中文",
+        [
+            ("zh-CN-liaoning-XiaobeiNeural", "中文女生 · 辽宁晓北"),
+            ("zh-CN-shaanxi-XiaoniNeural", "中文女生 · 陕西晓妮"),
+            ("zh-HK-HiuGaaiNeural", "粤语女生 · 曉佳"),
+            ("zh-HK-HiuMaanNeural", "粤语女生 · 曉曼"),
+            ("zh-HK-WanLungNeural", "粤语男生 · 雲龍"),
+            ("zh-TW-HsiaoChenNeural", "中文台湾女生 · 曉臻"),
+            ("zh-TW-HsiaoYuNeural", "中文台湾女生 · 曉雨"),
+            ("zh-TW-YunJheNeural", "中文台湾男生 · 雲哲"),
+        ],
+    ),
+    (
+        "英语常用",
+        [
+            ("en-US-AvaNeural", "English Female · Ava"),
+            ("en-US-EmmaNeural", "English Female · Emma"),
+            ("en-US-JennyNeural", "English Female · Jenny"),
+            ("en-US-MichelleNeural", "English Female · Michelle"),
+            ("en-US-AriaNeural", "English Female · Aria"),
+            ("en-US-AndrewNeural", "English Male · Andrew"),
+            ("en-US-BrianNeural", "English Male · Brian"),
+            ("en-US-GuyNeural", "English Male · Guy"),
+            ("en-US-RogerNeural", "English Male · Roger"),
+            ("en-US-DavisNeural", "English Male · Davis"),
+        ],
+    ),
 ]
 VALID_VOICE_IDS = {voice_id for voice_id, _label in VOICE_OPTIONS}
 VALID_RATES = {"-20%", "-12%", "-5%", "+0%", "+10%"}
 VALID_OUTPUT_MODES = {"per_chapter", "single_file"}
 MAX_PARALLEL_CHAPTERS = 3
-SPECIAL_HEADING_RE = re.compile(r"^(序|序章|前言|引言|楔子|后记|尾声|附录|番外|终章)$")
+SPECIAL_HEADING_RE = re.compile(r"^(序|序言|序章|前言|引言|楔子|后记|尾声|附录|番外|终章)$")
 PART_HEADING_RE = re.compile(
     r"^(上篇|中篇|下篇|终篇|第[一二三四五六七八九十百千0-9]+[篇卷部册集辑](?:$|[\s:：\-][^\n]{0,30}))$"
 )
@@ -267,6 +320,24 @@ HTML_PAGE = """<!doctype html>
       font-weight: 700;
       line-height: 1.45;
     }
+    .text-preview {
+      margin-bottom: 14px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+    .text-preview pre {
+      margin: 8px 0 0;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--ink);
+    }
     .muted {
       color: var(--muted);
       font-size: 13px;
@@ -308,7 +379,7 @@ HTML_PAGE = """<!doctype html>
   <div class="wrap">
     <section class="hero">
       <h1>Book To Audio</h1>
-      <p>导入 epub / mobi / pdf，解析章节，选择输出目录，然后生成中文 MP3 音频。界面为内嵌桌面客户端，本地运行。</p>
+      <p>导入 epub / mobi / pdf / txt / md，解析章节，选择输出目录，然后生成中文 MP3 音频。界面为内嵌桌面客户端，本地运行。</p>
     </section>
 
     <div class="grid">
@@ -316,7 +387,7 @@ HTML_PAGE = """<!doctype html>
         <h2>输入与输出</h2>
         <label>图书文件</label>
         <div class="row">
-          <input id="filePath" type="text" placeholder="请选择 epub / mobi / pdf 文件" />
+          <input id="filePath" type="text" placeholder="请选择 epub / mobi / pdf / txt / md 文件" />
           <button class="secondary" onclick="pickFile()">选择文件</button>
         </div>
 
@@ -327,20 +398,7 @@ HTML_PAGE = """<!doctype html>
         </div>
 
         <label>语音</label>
-        <select id="voice">
-          <option value="zh-CN-XiaoxiaoNeural">中文女生 · 晓晓</option>
-          <option value="zh-CN-XiaoyiNeural">中文女生 · 晓伊</option>
-          <option value="zh-CN-liaoning-XiaobeiNeural">中文女生 · 辽宁晓北</option>
-          <option value="zh-CN-shaanxi-XiaoniNeural">中文女生 · 陕西晓妮</option>
-          <option value="zh-CN-YunxiNeural">中文男生 · 云希</option>
-          <option value="zh-CN-YunjianNeural">中文男生 · 云健</option>
-          <option value="zh-CN-YunxiaNeural">中文男生 · 云夏</option>
-          <option value="zh-CN-YunyangNeural">中文男生 · 云扬</option>
-          <option value="en-US-JennyNeural">English Female · Jenny</option>
-          <option value="en-US-AriaNeural">English Female · Aria</option>
-          <option value="en-US-GuyNeural">English Male · Guy</option>
-          <option value="en-US-DavisNeural">English Male · Davis</option>
-        </select>
+        <select id="voice">__VOICE_OPTIONS_HTML__</select>
 
         <label>语速</label>
         <select id="rate">
@@ -378,6 +436,11 @@ HTML_PAGE = """<!doctype html>
           <div class="preview-title" id="previewTitle">试听播放器</div>
           <audio id="previewPlayer" controls preload="metadata"></audio>
           <div class="muted" id="previewHint">点击章节上的“朗读”生成临时试听音频。试听音频会保留到你手动点击“清理”为止。</div>
+        </div>
+        <div class="text-preview">
+          <div class="preview-title" id="textPreviewTitle">朗读文本预览</div>
+          <div class="muted" id="textPreviewHint">点击章节上的“查看文本”可以预览该章最终送入朗读前的文本。</div>
+          <pre id="textPreviewBody">暂无内容。</pre>
         </div>
         <div class="chapter-list" id="chapterList"></div>
       </section>
@@ -431,6 +494,7 @@ HTML_PAGE = """<!doctype html>
             <div class="chapter-preview">${renderPreviewMeta(item.sequence, idx)}</div>
             <div class="chapter-buttons">
               <button type="button" class="secondary mini" onclick="instantRead(event, ${idx})" ${previewBusyIndex === idx ? "disabled" : ""}>立即朗读</button>
+              <button type="button" class="ghost mini" onclick="viewChapterText(event, ${idx})">查看文本</button>
               <button type="button" class="ghost mini" onclick="playChapter(event, ${idx})">${renderPlayButtonLabel(idx)}</button>
               <button type="button" class="secondary mini" onclick="regeneratePreview(event, ${idx})" ${previewBusyIndex === idx ? "disabled" : ""}>重新生成</button>
               <button type="button" class="ghost mini" onclick="clearPreview(event, ${idx})" ${renderClearButtonDisabled(item.sequence, idx)}>清理</button>
@@ -702,6 +766,19 @@ HTML_PAGE = """<!doctype html>
       setStatus("试听缓存已清理。");
     }
 
+    async function viewChapterText(event, idx) {
+      stopButtonEvent(event);
+      const data = await postJson("/api/chapter-text", { index: idx });
+      if (!data.ok) {
+        setStatus(data.error || "文本预览加载失败。");
+        return;
+      }
+      document.getElementById("textPreviewTitle").textContent = `朗读文本预览 · ${data.title}`;
+      document.getElementById("textPreviewHint").textContent = "这是该章节清洗和规范化后的最终朗读文本。";
+      document.getElementById("textPreviewBody").textContent = data.text || "暂无内容。";
+      setStatus("已加载章节朗读文本。");
+    }
+
     async function pollStatus() {
       const res = await fetch("/api/status");
       const data = await res.json();
@@ -725,8 +802,6 @@ HTML_PAGE = """<!doctype html>
 </body>
 </html>
 """
-
-
 @dataclass
 class Chapter:
     title: str
@@ -753,6 +828,22 @@ def sanitize_filename(name: str) -> str:
     return safe[:80] or "output"
 
 
+def build_voice_options_html() -> str:
+    parts: list[str] = []
+    for group_label, items in VOICE_OPTION_GROUPS:
+        parts.append(f'<optgroup label="{html.escape(group_label)}">')
+        for voice_id, label in items:
+            selected = " selected" if voice_id == DEFAULT_VOICE else ""
+            parts.append(
+                f'<option value="{html.escape(voice_id)}"{selected}>{html.escape(label)}</option>'
+            )
+        parts.append("</optgroup>")
+    return "\n".join(parts)
+
+
+HTML_PAGE = HTML_PAGE.replace("__VOICE_OPTIONS_HTML__", build_voice_options_html())
+
+
 def html_fragment_to_text_and_title(content: bytes | str) -> tuple[str, str]:
     raw = content.decode("utf-8", errors="ignore") if isinstance(content, bytes) else content
     if BeautifulSoup is not None:
@@ -768,6 +859,16 @@ def html_fragment_to_text_and_title(content: bytes | str) -> tuple[str, str]:
     title_match = re.search(r"(?is)<(?:h1|h2|h3|title)[^>]*>(.*?)</(?:h1|h2|h3|title)>", raw)
     title = normalize_text(re.sub(r"(?is)<[^>]+>", " ", title_match.group(1))) if title_match else ""
     return text, title
+
+
+def read_text_with_fallbacks(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ["utf-8-sig", "utf-8", "gb18030", "gbk"]:
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore")
 
 
 def is_heading_like_line(text: str) -> bool:
@@ -983,6 +1084,71 @@ def build_output_filename(chapter: Chapter) -> str:
     return f"{prefix}-{sanitize_filename(chapter.title)}.mp3"
 
 
+def extract_txt_chapters(path: Path) -> list[Chapter]:
+    raw_text = read_text_with_fallbacks(path)
+    text = normalize_text(raw_text)
+    if not text:
+        raise ValueError("TXT 未提取到可用文本。")
+    chapters = split_structured_text("", raw_text)
+    lines = [line.strip() for line in raw_text.replace("\r", "\n").splitlines() if line.strip()]
+    if chapters and chapters[0].title == "章节" and lines and heading_level(lines[0]) > 0:
+        chapters[0].title = lines[0]
+        body = normalize_text(chapters[0].text)
+        if body.startswith(lines[0]):
+            chapters[0].text = normalize_text(body[len(lines[0]) :].strip())
+    if len(chapters) == 1 and chapters[0].title == "章节":
+        chapters[0].title = path.stem or "章节"
+    for idx, chapter in enumerate(chapters, start=1):
+        chapter.sequence = idx
+    return chapters
+
+
+def strip_markdown_inline(text: str) -> str:
+    text = re.sub(r"!\[[^\]]*]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)]\([^)]+\)", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"[*_~>#-]+", lambda m: " " if "\n" not in m.group(0) else m.group(0), text)
+    return text
+
+
+def extract_markdown_chapters(path: Path) -> list[Chapter]:
+    raw = read_text_with_fallbacks(path)
+    lines = raw.replace("\r", "\n").splitlines()
+    chapters: list[Chapter] = []
+    current_title = path.stem or "章节"
+    current_body: list[str] = []
+    in_code_block = False
+
+    def flush_current() -> None:
+        nonlocal current_body
+        body = normalize_text("\n".join(current_body))
+        if body:
+            chapters.append(Chapter(title=normalize_text(current_title) or "章节", text=body))
+        current_body = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading_match:
+            flush_current()
+            current_title = normalize_text(strip_markdown_inline(heading_match.group(2))) or current_title
+            continue
+        current_body.append(strip_markdown_inline(line))
+
+    flush_current()
+    if chapters:
+        return chapters
+    text = normalize_text(strip_markdown_inline(raw))
+    if not text:
+        raise ValueError("Markdown 未提取到可用文本。")
+    return split_structured_chapters([Chapter(title=path.stem or "章节", text=text)])
+
+
 def extract_epub_chapters(path: Path) -> list[Chapter]:
     if epub is None or ITEM_DOCUMENT is None:
         raise RuntimeError("当前环境缺少 EPUB 解析依赖 ebooklib。")
@@ -1051,6 +1217,10 @@ def extract_chapters(path: Path) -> list[Chapter]:
         chapters = extract_pdf_chapters(path)
     elif suffix == ".mobi":
         chapters = extract_mobi_chapters(path)
+    elif suffix == ".txt":
+        return extract_txt_chapters(path)
+    elif suffix in {".md", ".markdown"}:
+        return extract_markdown_chapters(path)
     else:
         raise ValueError(f"不支持的格式: {suffix}")
     return split_structured_chapters(chapters)
@@ -1206,7 +1376,7 @@ def pick_file_dialog() -> str:
     script = (
         "Add-Type -AssemblyName System.Windows.Forms;"
         "$dlg = New-Object System.Windows.Forms.OpenFileDialog;"
-        "$dlg.Filter = 'Books (*.epub;*.mobi;*.pdf)|*.epub;*.mobi;*.pdf|All files (*.*)|*.*';"
+        "$dlg.Filter = 'Books (*.epub;*.mobi;*.pdf;*.txt;*.md;*.markdown)|*.epub;*.mobi;*.pdf;*.txt;*.md;*.markdown|All files (*.*)|*.*';"
         "$dlg.Multiselect = $false;"
         "if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $dlg.FileName }"
     )
@@ -1430,6 +1600,26 @@ def normalize_instant_read_request(data: dict[str, Any], chapters: list[Chapter]
     }
 
 
+def normalize_chapter_text_request(data: dict[str, Any], chapters: list[Chapter]) -> dict[str, Any]:
+    if not chapters:
+        raise ValueError("请先解析章节。")
+    try:
+        idx = int(data.get("index", -1))
+    except (TypeError, ValueError):
+        raise ValueError("章节索引无效。") from None
+    if idx < 0 or idx >= len(chapters):
+        raise ValueError("章节索引无效。")
+    return {"index": idx, "chapter": chapters[idx]}
+
+
+def chapter_text_payload(chapter: Chapter) -> dict[str, Any]:
+    return {
+        "sequence": chapter.sequence,
+        "title": normalize_text(chapter.title) or "章节",
+        "text": normalize_text(chapter.text),
+    }
+
+
 def build_instant_audio_url(index: int, voice: str, rate: str) -> str:
     return f"/api/instant-audio?{urlencode({'index': index, 'voice': voice, 'rate': rate})}"
 
@@ -1508,6 +1698,9 @@ class BookHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/instant-read":
             self._handle_instant_read()
+            return
+        if parsed.path == "/api/chapter-text":
+            self._handle_chapter_text()
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1601,7 +1794,7 @@ class BookHandler(BaseHTTPRequestHandler):
             if not path.exists():
                 raise ValueError("图书文件不存在。")
             if path.suffix.lower() not in SUPPORTED_EXTS:
-                raise ValueError("目前只支持 epub / mobi / pdf。")
+                raise ValueError("目前只支持 epub / mobi / pdf / txt / md / markdown。")
             chapters = extract_chapters(path)
             if not chapters:
                 raise ValueError("没有解析到可朗读内容。")
@@ -1782,6 +1975,16 @@ class BookHandler(BaseHTTPRequestHandler):
             asyncio.run(stream_text_to_http(normalized["chapter"].text, self, normalized["voice"], normalized["rate"]))
         except ValueError:
             self.send_error(HTTPStatus.BAD_REQUEST)
+
+    def _handle_chapter_text(self) -> None:
+        try:
+            data = self._read_json()
+            with STATE.lock:
+                chapters = list(STATE.chapters)
+            normalized = normalize_chapter_text_request(data, chapters)
+            self._send_json({"ok": True, **chapter_text_payload(normalized["chapter"])})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"文本预览加载失败：{exc}"}, 500)
 
 
 def find_free_port() -> int:
